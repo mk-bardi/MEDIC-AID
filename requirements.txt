@@ -1,0 +1,1 @@
+-r medic_aid_bot/requirements.txt
