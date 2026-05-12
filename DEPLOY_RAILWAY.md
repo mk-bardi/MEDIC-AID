@@ -87,32 +87,57 @@ git push -u origin claude/medic-aid-telegram-bot-oVs01
 
 ## Part E — Wire up the Wokwi simulator
 
-Your Wokwi project is at
-<https://wokwi.com/projects/463772405856432129>. Open it and:
+Your existing Wokwi project at
+<https://wokwi.com/projects/463772405856432129> already has the steppers,
+drop-sensor buttons, RTC, buzzer and LED wired up exactly as the firmware
+expects. **Leave `diagram.json` alone** — no changes needed.
 
-1. Replace (or merge into) the existing `sketch.ino` with
-   `firmware/esp32_medicaid.ino` from this repo. Keep your existing pin
-   definitions and any motor/servo/sensor wiring code — only the networking
-   and bot-protocol functions need to come from the new file.
-2. In the `USER CONFIG` block at the top of the sketch, set:
+1. Open the project, click `sketch.ino`, select all, and replace its
+   contents with `firmware/esp32_medicaid.ino` from this repo. The new
+   sketch is your original state-machine code plus Wi-Fi, polling, and
+   bot-protocol functions — all the same pins, the same dispense logic,
+   the same fault detection.
+2. Near the top of the sketch, in the `USER CONFIG` block, set the two
+   placeholders:
    ```cpp
-   const char* BOT_BASE_URL  = "https://YOUR-APP.up.railway.app";
-   const char* DEVICE_TOKEN  = "the same hex string you put in Railway";
+   const char* BOT_BASE_URL = "https://YOUR-APP.up.railway.app";
+   const char* DEVICE_TOKEN = "the same hex string you put in Railway";
    ```
    Leave `WIFI_SSID = "Wokwi-GUEST"` and `WIFI_PASSWORD = ""` — those are
    Wokwi's simulated network.
-3. Open **Library Manager** (left sidebar → Libraries tab → `+`) and add
-   `ArduinoJson`. `WiFi`, `HTTPClient`, and `WiFiClientSecure` ship with
-   the ESP32 core, no install needed.
+3. Open **Library Manager** (left sidebar → Libraries tab → `+`) and add:
+   - **ArduinoJson** (Benoit Blanchon)
+   - **RTClib** (Adafruit) — if not already present
+   `WiFi`, `HTTPClient`, `WiFiClientSecure`, and `Stepper` ship with the
+   ESP32 core, no install needed.
 4. Press **▶ Start simulation**. In the serial monitor you should see:
    ```
-   Connecting to Wokwi-GUEST .... connected, IP=10.13.37.2
-   [schedule] loaded 3 entries
+   === MEDIC-AID (bot-connected) booting ===
+   [WIFI] Connecting to Wokwi-GUEST .... connected, IP=10.13.37.2
+   [SCHED] synced 3 entries from bot
+     - 08:00  1/2/1
+     - 14:00  1/0/1
+     - 20:00  2/1/0
+   === Ready ===
+   [IDLE] HH:MM:SS  wifi=1
    ```
-5. In Telegram, send `/dispense_stage 1 2` as the caregiver. Within ~2
-   seconds the Wokwi serial monitor should print
-   `[cmd] dispense_stage (id=…)` and `[motor] dispense stage 1, 2 pills`,
-   and your Telegram should get `✓ Stage dispensed`-style notifications.
+5. From the caregiver Telegram chat, send `/dispense_stage 1 2`. Within
+   2 seconds the Wokwi serial monitor should print:
+   ```
+   [CMD] dispense_stage (id=42)
+   [DOSE] manual-stage start  2/0/0
+   [STAGE 1] dispensing 2 pill(s)
+   [STAGE 1] slot 1 advanced — waiting for drop...
+   ```
+   **In the Wokwi window, click the green DROP 1 button twice** to simulate
+   pills falling into the tray (the original firmware uses these buttons as
+   stand-ins for IR drop sensors). The dose then completes and both your
+   Telegram accounts get notifications.
+6. To test a full three-stage dose, send `/dispense`. You'll need to press
+   the matching DROP button(s) once per pill in each stage. If you let the
+   drop-timeout (3 s) elapse 8 times without pressing the button, the
+   firmware will fault with `empty_bottle` and the caregiver receives a
+   🚨 fault alert.
 
 ---
 

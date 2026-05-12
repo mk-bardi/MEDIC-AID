@@ -1,82 +1,191 @@
-// MEDIC-AID dispenser firmware — Arduino/C++ for ESP32 (Wokwi-compatible).
-//
-// This is a reference skeleton that talks to the Python bot over HTTPS.
-// Replace the pin numbers and state-machine details with your own dispenser
-// hardware. The networking and bot-protocol bits are the parts you should
-// keep largely as-is.
-//
-// Required libraries (install via Arduino IDE Library Manager or PlatformIO):
-//   - WiFi             (built in to ESP32 core)
-//   - HTTPClient       (built in to ESP32 core)
-//   - WiFiClientSecure (built in)
-//   - ArduinoJson      (Benoit Blanchon)
-//
-// In Wokwi the simulated Wi-Fi uses SSID "Wokwi-GUEST" with an empty password.
+/*
+ * ============================================================
+ *  MEDIC-AID — 3-Stage Automated Pill Dispenser
+ *  Wokwi Simulation Firmware (ESP32) — Bot-Connected build
+ *  Author: MKBARDI
+ * ============================================================
+ *
+ *  This is the original MEDIC-AID firmware merged with the
+ *  Telegram-bot HTTP protocol (poll/event/schedule/command_result).
+ *  All hardware behaviour from the original sketch is preserved:
+ *
+ *    Stage 1 stepper : GPIO 14, 27, 26, 25
+ *    Stage 2 stepper : GPIO 33, 32, 18, 19
+ *    Stage 3 stepper : GPIO  5, 17, 16,  4
+ *    Drop sensors    : GPIO 34 (1), 35 (2), 36 (3)
+ *    RTC (I2C)       : SDA=21, SCL=22
+ *    Buzzer          : GPIO 23
+ *    Status LED      : GPIO 13
+ *
+ *  Required Wokwi libraries (Library Manager → "+"):
+ *    RTClib            (Adafruit)
+ *    Stepper           (Arduino built-in for ESP32 core)
+ *    ArduinoJson       (Benoit Blanchon)
+ *  WiFi / HTTPClient / WiFiClientSecure ship with the ESP32 core.
+ * ============================================================
+ */
 
+#include <Wire.h>
+#include <RTClib.h>
+#include <Stepper.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
 
-// ---------- USER CONFIG ----------
+// ---------- USER CONFIG (edit these two lines) ----------
+const char* BOT_BASE_URL = "https://YOUR-APP.up.railway.app";
+const char* DEVICE_TOKEN = "REPLACE-WITH-SAME-DEVICE-TOKEN-AS-RAILWAY";
+// Wokwi simulated Wi-Fi:
 const char* WIFI_SSID     = "Wokwi-GUEST";
 const char* WIFI_PASSWORD = "";
+// ---------------------------------------------------------
 
-// Set this to your Railway URL (no trailing slash).
-const char* BOT_BASE_URL  = "https://YOUR-APP.up.railway.app";
+// ---------- CONFIG ----------
+const int STEPS_PER_REV  = 200;
+const int STEPS_PER_SLOT = 50;
+const int MAX_SLOTS_PER_DOSE = 8;
+const unsigned long DROP_TIMEOUT_MS = 3000;
+const unsigned long ALERT_DURATION_MS = 5000;
+const unsigned long POLL_INTERVAL_MS = 2000;
 
-// Must match DEVICE_TOKEN in the bot's Railway env vars.
-const char* DEVICE_TOKEN  = "REPLACE-WITH-LONG-RANDOM-STRING";
+// ---------- PINS ----------
+const int STEPPER_PINS[3][4] = {
+  {14, 27, 26, 25},
+  {33, 32, 18, 19},
+  { 5, 17, 16,  4}
+};
+const int DROP_PINS[3] = {34, 35, 36};
+const int BUZZER_PIN = 23;
+const int LED_PIN    = 13;
 
-const unsigned long POLL_INTERVAL_MS = 2000;   // poll every 2s
-// ---------------------------------
+// ---------- OBJECTS ----------
+RTC_DS1307 rtc;
+Stepper steppers[3] = {
+  Stepper(STEPS_PER_REV, STEPPER_PINS[0][0], STEPPER_PINS[0][1], STEPPER_PINS[0][2], STEPPER_PINS[0][3]),
+  Stepper(STEPS_PER_REV, STEPPER_PINS[1][0], STEPPER_PINS[1][1], STEPPER_PINS[1][2], STEPPER_PINS[1][3]),
+  Stepper(STEPS_PER_REV, STEPPER_PINS[2][0], STEPPER_PINS[2][1], STEPPER_PINS[2][2], STEPPER_PINS[2][3])
+};
 
-unsigned long lastPollMs = 0;
-
-struct ScheduleEntry {
-  String slot;
+// ---------- SCHEDULE ----------
+struct DoseSchedule {
   int hour;
   int minute;
-  int p1, p2, p3;
+  int pills[3];
 };
-ScheduleEntry schedule[3];
-int scheduleCount = 0;
+DoseSchedule schedule[] = {
+  { 8, 0, 1, 2, 1},
+  {14, 0, 1, 0, 1},
+  {20, 0, 2, 1, 0}
+};
+const int NUM_DOSES = sizeof(schedule) / sizeof(schedule[0]);
 
-// ---------- Wi-Fi ----------
+// Whichever dose is currently running (copied from schedule[] or built from a
+// bot command). Letting the state machine work off this copy means manual
+// commands and scheduled doses share the same code path.
+DoseSchedule activeDose = {0, 0, {0, 0, 0}};
+
+// ---------- STATE ----------
+enum State { IDLE, ALERT_PATIENT, DISPENSE_STAGE, WAIT_FOR_DROP, COMPLETE, FAULT };
+State state = IDLE;
+
+int currentStage = 0;
+int pillsTarget = 0;
+int pillsDropped = 0;
+int slotsAdvanced = 0;
+int lastTriggeredMinute = -1;
+unsigned long stateEnteredAt = 0;
+unsigned long lastDropEdgeAt = 0;
+int lastDropReading[3] = {HIGH, HIGH, HIGH};
+
+// Track which bot command (if any) launched the current dose so we can post
+// /api/command_result when it finishes. -1 means scheduled / no command.
+int activeCommandId = -1;
+
+// Last fault reason for reporting.
+const char* lastFaultReason = "unknown";
+int lastFaultStage = 0;
+
+// ---------- HELPERS ----------
+void enterState(State s) {
+  state = s;
+  stateEnteredAt = millis();
+}
+
+void buzz(int durationMs) {
+  digitalWrite(BUZZER_PIN, HIGH);
+  delay(durationMs);
+  digitalWrite(BUZZER_PIN, LOW);
+}
+
+bool checkDropEdge(int stage) {
+  int reading = digitalRead(DROP_PINS[stage]);
+  bool edge = (lastDropReading[stage] == HIGH && reading == LOW);
+  lastDropReading[stage] = reading;
+  if (edge && millis() - lastDropEdgeAt > 100) {
+    lastDropEdgeAt = millis();
+    return true;
+  }
+  return false;
+}
+
+int findDueDose(const DateTime& now) {
+  for (int i = 0; i < NUM_DOSES; i++) {
+    if (now.hour() == schedule[i].hour && now.minute() == schedule[i].minute) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+// =========================================================
+//   Wi-Fi + bot HTTP helpers
+// =========================================================
+bool wifiReady = false;
+unsigned long lastPollMs = 0;
+
 void connectWifi() {
-  Serial.printf("Connecting to %s ", WIFI_SSID);
+  Serial.printf("[WIFI] Connecting to %s ", WIFI_SSID);
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  while (WiFi.status() != WL_CONNECTED) {
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
     delay(250);
     Serial.print(".");
   }
-  Serial.printf(" connected, IP=%s\n", WiFi.localIP().toString().c_str());
+  wifiReady = (WiFi.status() == WL_CONNECTED);
+  if (wifiReady) {
+    Serial.printf(" connected, IP=%s\n", WiFi.localIP().toString().c_str());
+  } else {
+    Serial.println(" FAILED — continuing offline");
+  }
 }
 
-// ---------- HTTP helpers ----------
-// Wokwi's TLS is permissive; for production use a real CA bundle.
-WiFiClientSecure makeTlsClient() {
+// Wokwi's TLS is permissive in simulation; for production replace setInsecure()
+// with a real CA bundle.
+bool httpGet(const String& path, String& outBody) {
+  if (!wifiReady) return false;
   WiFiClientSecure client;
   client.setInsecure();
-  return client;
-}
-
-bool httpGet(const String& path, String& outBody) {
-  WiFiClientSecure client = makeTlsClient();
   HTTPClient http;
   String url = String(BOT_BASE_URL) + path;
   if (!http.begin(client, url)) return false;
   http.addHeader("X-Device-Token", DEVICE_TOKEN);
   int code = http.GET();
-  if (code <= 0) { http.end(); return false; }
+  if (code != 200) {
+    if (code <= 0) Serial.printf("[HTTP] GET %s failed: %d\n", path.c_str(), code);
+    http.end();
+    return false;
+  }
   outBody = http.getString();
   http.end();
-  return code == 200;
+  return true;
 }
 
 bool httpPostJson(const String& path, const String& body) {
-  WiFiClientSecure client = makeTlsClient();
+  if (!wifiReady) return false;
+  WiFiClientSecure client;
+  client.setInsecure();
   HTTPClient http;
   String url = String(BOT_BASE_URL) + path;
   if (!http.begin(client, url)) return false;
@@ -84,30 +193,32 @@ bool httpPostJson(const String& path, const String& body) {
   http.addHeader("Content-Type", "application/json");
   int code = http.POST(body);
   http.end();
-  return code >= 200 && code < 300;
+  if (code < 200 || code >= 300) {
+    Serial.printf("[HTTP] POST %s -> %d\n", path.c_str(), code);
+    return false;
+  }
+  return true;
 }
 
-// ---------- Event reporting ----------
 void postEvent(const char* eventType,
                int stage = -1,
-               int pillsTarget = -1,
+               int pillsTargetVal = -1,
                int pillsActual = -1,
                const char* faultReason = nullptr) {
   StaticJsonDocument<256> doc;
   doc["event_type"] = eventType;
-  if (stage >= 0)        doc["stage"] = stage;
-  if (pillsTarget >= 0)  doc["pills_target"] = pillsTarget;
-  if (pillsActual >= 0)  doc["pills_actual"] = pillsActual;
-  if (faultReason)       doc["fault_reason"] = faultReason;
+  if (stage >= 0)          doc["stage"] = stage + 1;       // human-friendly 1-indexed
+  if (pillsTargetVal >= 0) doc["pills_target"] = pillsTargetVal;
+  if (pillsActual >= 0)    doc["pills_actual"] = pillsActual;
+  if (faultReason)         doc["fault_reason"] = faultReason;
   String body;
   serializeJson(doc, body);
-  if (!httpPostJson("/api/event", body)) {
-    Serial.printf("[event] failed to post %s\n", eventType);
-  }
+  httpPostJson("/api/event", body);
 }
 
 void postCommandResult(int commandId, const char* status, const char* detail) {
-  StaticJsonDocument<128> doc;
+  if (commandId < 0) return;
+  StaticJsonDocument<160> doc;
   doc["command_id"] = commandId;
   doc["status"] = status;
   if (detail) doc["detail"] = detail;
@@ -115,81 +226,138 @@ void postCommandResult(int commandId, const char* status, const char* detail) {
   httpPostJson("/api/command_result", body);
 }
 
-// ---------- Schedule refresh ----------
+// =========================================================
+//   Schedule sync from the bot
+// =========================================================
 void fetchSchedule() {
   String body;
-  if (!httpGet("/api/schedule", body)) {
-    Serial.println("[schedule] fetch failed");
+  if (!httpGet("/api/schedule", body)) return;
+  StaticJsonDocument<1024> doc;
+  if (deserializeJson(doc, body)) {
+    Serial.println("[SCHED] parse failed");
     return;
   }
-  StaticJsonDocument<1024> doc;
-  if (deserializeJson(doc, body)) return;
-  scheduleCount = 0;
-  for (JsonObject s : doc["schedules"].as<JsonArray>()) {
-    if (scheduleCount >= 3) break;
-    schedule[scheduleCount++] = {
-      s["slot"].as<String>(),
-      s["hour"], s["minute"],
-      s["pills_stage1"], s["pills_stage2"], s["pills_stage3"]
-    };
+  JsonArray arr = doc["schedules"].as<JsonArray>();
+  int i = 0;
+  for (JsonObject s : arr) {
+    if (i >= NUM_DOSES) break;
+    schedule[i].hour     = s["hour"]   | schedule[i].hour;
+    schedule[i].minute   = s["minute"] | schedule[i].minute;
+    schedule[i].pills[0] = s["pills_stage1"] | schedule[i].pills[0];
+    schedule[i].pills[1] = s["pills_stage2"] | schedule[i].pills[1];
+    schedule[i].pills[2] = s["pills_stage3"] | schedule[i].pills[2];
+    i++;
   }
-  Serial.printf("[schedule] loaded %d entries\n", scheduleCount);
+  Serial.printf("[SCHED] synced %d entries from bot\n", i);
+  for (int j = 0; j < i; j++) {
+    Serial.printf("  - %02d:%02d  %d/%d/%d\n",
+                  schedule[j].hour, schedule[j].minute,
+                  schedule[j].pills[0], schedule[j].pills[1], schedule[j].pills[2]);
+  }
 }
 
-// ---------- Dispenser hardware stubs ----------
-// Replace these with your actual servo/motor/sensor code from the Wokwi project.
-bool dispenseStage(int stage, int pills) {
-  Serial.printf("[motor] dispense stage %d, %d pills\n", stage, pills);
-  delay(300 * pills);
-  // return false here if the drop sensor doesn't see pills move.
-  return true;
+// =========================================================
+//   Dose lifecycle (works for both scheduled + manual doses)
+// =========================================================
+void startActiveDose(const char* sourceLabel) {
+  currentStage = 0;
+  while (currentStage < 3 && activeDose.pills[currentStage] == 0) currentStage++;
+  if (currentStage >= 3) {
+    Serial.println("[DOSE] no pills in any stage — skipping");
+    postCommandResult(activeCommandId, "failed", "no pills configured");
+    activeCommandId = -1;
+    enterState(IDLE);
+    return;
+  }
+  Serial.printf("[DOSE] %s start  %d/%d/%d\n",
+                sourceLabel,
+                activeDose.pills[0], activeDose.pills[1], activeDose.pills[2]);
+
+  StaticJsonDocument<192> doc;
+  doc["event_type"] = "dose_started";
+  doc["pills_stage1"] = activeDose.pills[0];
+  doc["pills_stage2"] = activeDose.pills[1];
+  doc["pills_stage3"] = activeDose.pills[2];
+  String body; serializeJson(doc, body);
+  httpPostJson("/api/event", body);
+
+  digitalWrite(LED_PIN, HIGH);
+  enterState(ALERT_PATIENT);
 }
 
-void runDose(int p1, int p2, int p3) {
-  postEvent("dose_started", -1, p1 + p2 + p3);
-  int total = 0;
-  int stagePills[3] = {p1, p2, p3};
-  for (int i = 0; i < 3; i++) {
-    if (stagePills[i] <= 0) continue;
-    if (!dispenseStage(i + 1, stagePills[i])) {
-      postEvent("fault", i + 1, stagePills[i], total, "no_drop_detected");
+void startStage(int stage) {
+  pillsTarget = activeDose.pills[stage];
+  pillsDropped = 0;
+  slotsAdvanced = 0;
+  Serial.printf("[STAGE %d] dispensing %d pill(s)\n", stage + 1, pillsTarget);
+  enterState(DISPENSE_STAGE);
+}
+
+void advanceToNextStage() {
+  postEvent("stage_dispensed", currentStage, pillsTarget, pillsDropped);
+  currentStage++;
+  while (currentStage < 3 && activeDose.pills[currentStage] == 0) currentStage++;
+  if (currentStage >= 3) {
+    int total = activeDose.pills[0] + activeDose.pills[1] + activeDose.pills[2];
+    Serial.println("[DOSE] all stages complete");
+    postEvent("dose_completed", -1, total, total);
+    if (activeCommandId >= 0) {
+      postCommandResult(activeCommandId, "executed", "dose completed");
+      activeCommandId = -1;
+    }
+    digitalWrite(LED_PIN, LOW);
+    enterState(COMPLETE);
+  } else {
+    startStage(currentStage);
+  }
+}
+
+// =========================================================
+//   Command dispatch (called from pollOnce)
+// =========================================================
+void handleBotCommand(JsonDocument& doc) {
+  const char* name = doc["command"] | "none";
+  int cmdId = doc["command_id"] | -1;
+  JsonObject params = doc["params"].as<JsonObject>();
+
+  if (strcmp(name, "none") == 0) return;
+
+  if (state != IDLE) {
+    Serial.printf("[CMD] %s ignored — dispenser busy\n", name);
+    postCommandResult(cmdId, "failed", "device busy");
+    return;
+  }
+
+  Serial.printf("[CMD] %s (id=%d)\n", name, cmdId);
+
+  if (strcmp(name, "dispense_all") == 0) {
+    activeDose.hour = 0; activeDose.minute = 0;
+    activeDose.pills[0] = params["stage1"] | 1;
+    activeDose.pills[1] = params["stage2"] | 1;
+    activeDose.pills[2] = params["stage3"] | 1;
+    activeCommandId = cmdId;
+    startActiveDose("manual-all");
+  }
+  else if (strcmp(name, "dispense_stage") == 0) {
+    int stage = (params["stage"] | 1) - 1;   // bot sends 1-indexed
+    int pills = params["pills"] | 1;
+    if (stage < 0 || stage > 2) {
+      postCommandResult(cmdId, "failed", "invalid stage");
       return;
     }
-    postEvent("stage_dispensed", i + 1, stagePills[i], stagePills[i]);
-    total += stagePills[i];
+    activeDose.hour = 0; activeDose.minute = 0;
+    activeDose.pills[0] = 0; activeDose.pills[1] = 0; activeDose.pills[2] = 0;
+    activeDose.pills[stage] = pills;
+    activeCommandId = cmdId;
+    startActiveDose("manual-stage");
   }
-  postEvent("dose_completed", -1, p1 + p2 + p3, total);
-}
-
-// ---------- Command dispatch ----------
-void handleCommand(JsonObject cmd) {
-  String name = cmd["command"].as<String>();
-  int id = cmd["command_id"] | -1;
-  JsonObject params = cmd["params"].as<JsonObject>();
-
-  if (name == "none") return;
-
-  Serial.printf("[cmd] %s (id=%d)\n", name.c_str(), id);
-
-  if (name == "dispense_all") {
-    int p1 = params["stage1"] | 1;
-    int p2 = params["stage2"] | 1;
-    int p3 = params["stage3"] | 1;
-    runDose(p1, p2, p3);
-    postCommandResult(id, "executed", "dispense_all done");
-  } else if (name == "dispense_stage") {
-    int stage = params["stage"] | 1;
-    int pills = params["pills"] | 1;
-    bool ok = dispenseStage(stage, pills);
-    postEvent(ok ? "stage_dispensed" : "fault",
-              stage, pills, ok ? pills : 0,
-              ok ? nullptr : "no_drop_detected");
-    postCommandResult(id, ok ? "executed" : "failed", nullptr);
-  } else if (name == "update_schedule") {
+  else if (strcmp(name, "update_schedule") == 0) {
     fetchSchedule();
-    postCommandResult(id, "executed", "schedule refreshed");
-  } else {
-    postCommandResult(id, "failed", "unknown command");
+    postCommandResult(cmdId, "executed", "schedule refreshed");
+  }
+  else {
+    Serial.printf("[CMD] unknown: %s\n", name);
+    postCommandResult(cmdId, "failed", "unknown command");
   }
 }
 
@@ -197,30 +365,149 @@ void pollOnce() {
   String body;
   if (!httpGet("/api/poll", body)) return;
   StaticJsonDocument<512> doc;
-  if (deserializeJson(doc, body)) return;
-  handleCommand(doc.as<JsonObject>());
+  if (deserializeJson(doc, body)) {
+    Serial.println("[POLL] parse failed");
+    return;
+  }
+  handleBotCommand(doc);
 }
 
-// ---------- Time-based schedule check ----------
-// In production, sync NTP and trigger a dose when the wall clock matches a
-// schedule entry. Wokwi has no RTC by default; for the simulation, the easiest
-// way to test is to send /dispense from Telegram.
-void checkSchedule() { /* TODO: NTP + cron-style match */ }
-
-// ---------- setup / loop ----------
+// =========================================================
+//   setup / loop
+// =========================================================
 void setup() {
   Serial.begin(115200);
-  delay(200);
+  delay(500);
+  Serial.println("\n=== MEDIC-AID (bot-connected) booting ===");
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(LED_PIN, OUTPUT);
+  for (int i = 0; i < 3; i++) {
+    pinMode(DROP_PINS[i], INPUT_PULLUP);
+    steppers[i].setSpeed(30);
+  }
+
+  Wire.begin(21, 22);
+  if (!rtc.begin()) {
+    Serial.println("[ERR] RTC not found!");
+    while (1) delay(1000);
+  }
+  if (!rtc.isrunning()) {
+    Serial.println("[RTC] not running — setting to compile time");
+    rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+  }
+
   connectWifi();
   fetchSchedule();
+  Serial.println("=== Ready ===\n");
 }
 
 void loop() {
-  unsigned long now = millis();
-  if (now - lastPollMs >= POLL_INTERVAL_MS) {
-    lastPollMs = now;
+  DateTime now = rtc.now();
+
+  // Poll the bot at most every POLL_INTERVAL_MS. Only when IDLE so we never
+  // interrupt an in-progress dose with a slow HTTPS round-trip.
+  if (state == IDLE && wifiReady && millis() - lastPollMs >= POLL_INTERVAL_MS) {
+    lastPollMs = millis();
     pollOnce();
   }
-  checkSchedule();
-  delay(10);
+
+  switch (state) {
+
+    case IDLE: {
+      int due = findDueDose(now);
+      if (due >= 0 && now.minute() != lastTriggeredMinute) {
+        lastTriggeredMinute = now.minute();
+        activeDose = schedule[due];
+        activeCommandId = -1;       // not a bot-triggered dose
+        startActiveDose("scheduled");
+      }
+      static unsigned long lastPrint = 0;
+      if (millis() - lastPrint > 5000) {
+        lastPrint = millis();
+        Serial.printf("[IDLE] %02d:%02d:%02d  wifi=%d\n",
+                      now.hour(), now.minute(), now.second(), wifiReady);
+      }
+      break;
+    }
+
+    case ALERT_PATIENT: {
+      static unsigned long lastBeep = 0;
+      if (millis() - lastBeep > 800) {
+        lastBeep = millis();
+        buzz(150);
+      }
+      if (millis() - stateEnteredAt >= ALERT_DURATION_MS) {
+        startStage(currentStage);
+      }
+      break;
+    }
+
+    case DISPENSE_STAGE: {
+      steppers[currentStage].step(STEPS_PER_SLOT);
+      slotsAdvanced++;
+      Serial.printf("[STAGE %d] slot %d advanced — waiting for drop...\n",
+                    currentStage + 1, slotsAdvanced);
+      lastDropReading[currentStage] = digitalRead(DROP_PINS[currentStage]);
+      enterState(WAIT_FOR_DROP);
+      break;
+    }
+
+    case WAIT_FOR_DROP: {
+      if (checkDropEdge(currentStage)) {
+        pillsDropped++;
+        Serial.printf("[STAGE %d] pill detected (%d/%d)\n",
+                      currentStage + 1, pillsDropped, pillsTarget);
+        if (pillsDropped >= pillsTarget) {
+          advanceToNextStage();
+        } else {
+          enterState(DISPENSE_STAGE);
+        }
+      } else if (millis() - stateEnteredAt > DROP_TIMEOUT_MS) {
+        if (slotsAdvanced >= MAX_SLOTS_PER_DOSE) {
+          lastFaultStage = currentStage;
+          lastFaultReason = (pillsDropped == 0) ? "empty_bottle" : "jam_suspected";
+          Serial.printf("[STAGE %d] FAULT — %s after %d slots\n",
+                        currentStage + 1, lastFaultReason, slotsAdvanced);
+          postEvent("fault", currentStage, pillsTarget, pillsDropped, lastFaultReason);
+          if (activeCommandId >= 0) {
+            postCommandResult(activeCommandId, "failed", lastFaultReason);
+            activeCommandId = -1;
+          }
+          enterState(FAULT);
+        } else {
+          enterState(DISPENSE_STAGE);
+        }
+      }
+      break;
+    }
+
+    case COMPLETE: {
+      buzz(100); delay(100);
+      buzz(100); delay(100);
+      buzz(100);
+      enterState(IDLE);
+      break;
+    }
+
+    case FAULT: {
+      digitalWrite(LED_PIN, HIGH);
+      buzz(800);
+      digitalWrite(LED_PIN, LOW);
+      delay(400);
+      if (millis() - stateEnteredAt > 10000) enterState(IDLE);
+      break;
+    }
+  }
 }
+
+/* ============================================================
+ *  ESP32-C3 BEETLE PIN MIGRATION (for real hardware)
+ *  The C3 has limited GPIOs. Suggested remap:
+ *    Stage 1 stepper : GPIO  0,  1,  2,  3
+ *    Stage 2 stepper : GPIO  4,  5,  6,  7
+ *    Stage 3 stepper : GPIO 10, 18, 19, 20
+ *    Drop sensors    : GPIO  8,  9, 21
+ *    RTC (I2C)       : SDA=8,  SCL=9
+ *    Buzzer / LED    : remaining pins
+ * ============================================================ */
