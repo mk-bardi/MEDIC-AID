@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: medic-aid-bot
+    runtime: python
+    plan: free
+    region: oregon
+    branch: claude/medic-aid-telegram-bot-oVs01
+    buildCommand: pip install -r medic_aid_bot/requirements.txt
+    startCommand: python -m medic_aid_bot.main
+    healthCheckPath: /api/health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: DEVICE_TOKEN
+        sync: false
+      - key: TIMEZONE
+        value: Africa/Lagos
+      - key: DATABASE_PATH
+        value: /tmp/medicaid.db
